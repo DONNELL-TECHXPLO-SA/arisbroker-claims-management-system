@@ -1,0 +1,730 @@
+// ============================================================================
+// Aris Brokers — Claims Management Portal
+// Proposed Phase 1 database schema (DRAFT — pending review, not yet built)
+//
+// This file is the concrete schema companion to ../README.md, which explains
+// the reasoning behind every design decision below and flags every place an
+// assumption was made where the BRD was ambiguous. Read that file first.
+//
+// Location once implementation starts: apps/api/prisma/schema.prisma
+// (see ../../03-architecture/system-architecture.md §5–6).
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ----------------------------------------------------------------------------
+// ENUMS — code-governed, stable sets tied to business rules / state machines.
+// See README §2 for the enum-vs-reference-table principle.
+// ----------------------------------------------------------------------------
+
+/// The five system roles — user-roles.md.
+enum UserRole {
+  ADMINISTRATOR
+  MANAGER
+  BROKER_USER
+  CLIENT_PRIMARY
+  CLIENT_SECONDARY
+}
+
+/// Onboarding lifecycle for Client/Policy/PolicySection/Asset records —
+/// the "Incomplete/draft" state from UC-09 / data-migration-requirements.md.
+/// A DRAFT record cannot be selected during claim submission (business rule #15).
+enum RecordStatus {
+  DRAFT
+  ACTIVE
+}
+
+/// data-requirements.md §12.1 — "Class of Insurance | Lookup (Motor / Non-Motor)".
+enum ClassOfInsurance {
+  MOTOR
+  NON_MOTOR
+}
+
+enum ExcessType {
+  AMOUNT
+  PERCENTAGE
+}
+
+/// data-requirements.md §12.1 — "Premium Payment Frequency | Lookup | E.g. Yearly, Monthly".
+/// Kept as a fixed enum, not an admin-maintainable reference table — see README §7.1.
+enum PaymentFrequency {
+  MONTHLY
+  QUARTERLY
+  SEMI_ANNUALLY
+  ANNUALLY
+  OTHER
+}
+
+/// data-requirements.md §12.2 — "Asset Type | Lookup | E.g. Vehicle, Building, Equipment, Other".
+enum AssetType {
+  VEHICLE
+  BUILDING
+  EQUIPMENT
+  OTHER
+}
+
+/// FR-33 — how a claim entered the system.
+enum LodgementChannel {
+  CLIENT_SELF_SERVICE
+  BROKER_ASSISTED
+}
+
+/// process-flow.md "Claim Status Stages (Client-Facing)" — 16 stages.
+/// Exact client-facing WORDING is Q-003 (open); these are internal codes only.
+/// Display label/colour per status is admin-configurable — see ClaimStatusReportLabel.
+enum ClaimStatus {
+  PARTIALLY_SUBMITTED
+  SUBMITTED
+  DOCUMENTS_OUTSTANDING
+  SUBMITTED_TO_INSURER
+  UNDER_ASSESSMENT
+  ASSESSMENT_COMPLETED
+  AWAITING_INSURER_DECISION
+  SETTLED
+  REPUDIATED
+  WITHIN_EXCESS
+  DISPUTED
+  AWAITING_SIGNED_AOL
+  AWAITING_EXCESS_INVOICE_AND_POP
+  AWAITING_INSURER_PAYMENT
+  NOT_TAKEN_UP
+  CLOSED
+}
+
+/// FR-12 / business rule #8 — the Insurer's decision. Distinct from ClaimStatus —
+/// see README §5 "Why ClaimStatus and DecisionOutcome both exist".
+enum DecisionOutcome {
+  SETTLED
+  REPUDIATED
+  WITHIN_EXCESS
+}
+
+/// FR-12 — only meaningful when decisionOutcome = SETTLED.
+enum SettlementMethod {
+  CASH
+  REPAIR
+  REPLACEMENT
+}
+
+/// FR-30 — system-calculated, never captured directly.
+enum Progress {
+  OUTSTANDING
+  RESOLVED
+}
+
+/// data-requirements.md §12.7 "Document Type" lookup, folded in with the
+/// generic stage/responsibility matrix from §12.8 — see README §7.3 for why
+/// this is an enum (several values gate business rules) rather than a table.
+enum DocumentType {
+  CLAIM_FORM
+  POLICE_REPORT
+  PHOTOS
+  THIRD_PARTY_DETAILS
+  QUOTATION
+  POLICY_SCHEDULE
+  AD_HOC
+  ASSESSMENT_REPORT // present for completeness; never actually uploaded — data-requirements §12.8: "Not held in the portal (Phase 1)"
+  AOL_UNSIGNED
+  AOL_SIGNED
+  REPAIR_AUTHORISATION
+  REPUDIATION_LETTER
+  PROOF_OF_PAYMENT
+  OTHER
+}
+
+/// UC-02 business rule 3 — standard (product-driven) vs Broker-added ad-hoc items.
+enum ChecklistItemSource {
+  STANDARD
+  AD_HOC
+}
+
+enum ChecklistItemStatus {
+  OUTSTANDING
+  RECEIVED
+}
+
+/// FR-07 trigger events + FR-33 lodgement confirmation + FR-08 message delivery.
+enum NotificationType {
+  DOCUMENTS_RECEIVED_ACK
+  INFORMATION_REQUESTED
+  INSURER_NUMBER_ALLOCATED
+  ASSESSOR_APPOINTED
+  DECISION_MADE
+  EXCESS_INVOICE_ISSUED
+  PROOF_OF_PAYMENT_RECEIVED
+  REMINDER_OUTSTANDING_ITEM
+  REMINDER_NO_STATUS_CHANGE
+  BROKER_ASSISTED_LODGEMENT_CONFIRMATION
+  COMMUNICATION_MESSAGE
+  CLAIM_CLOSED
+}
+
+/// NFR-11 — delivery failures must be logged and surfaced to the Administrator.
+enum NotificationDeliveryStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+enum ReportType {
+  CLAIMS_HISTORY
+  PERFORMANCE
+}
+
+/// FR-22 — consolidated (all of a client's policies) vs a single named policy.
+enum ReportScopeType {
+  CONSOLIDATED
+  SINGLE_POLICY
+}
+
+// ----------------------------------------------------------------------------
+// REFERENCE & CONFIGURATION DATA — admin-maintainable without a dev release
+// (per user-roles.md's Administrator description and FR-31).
+// ----------------------------------------------------------------------------
+
+/// The broker firm's own settings — FR-31 / data-requirements.md §12.11.
+/// Singleton: exactly one row should ever exist (enforced at the application
+/// layer; a `CHECK (id = 1)` constraint can be added in migration for defence
+/// in depth — see README §7.6).
+model CompanySettings {
+  id                          Int      @id @default(1)
+  registeredCompanyName       String   @map("registered_company_name")
+  tradingName                 String?  @map("trading_name")
+  fspLicenceNumber            String   @map("fsp_licence_number")
+  companyRegistrationNumber   String?  @map("company_registration_number")
+  logoStoragePath             String?  @map("logo_storage_path")
+  contactPhone                String?  @map("contact_phone")
+  contactEmail                String?  @map("contact_email")
+  contactAddress              String?  @map("contact_address")
+  /// Held per report type since wording may differ (FR-31) — Q-015 wording still pending.
+  claimsHistoryDisclaimerText String?  @map("claims_history_disclaimer_text")
+  performanceDisclaimerText   String?  @map("performance_disclaimer_text")
+  vatRateLabel                String   @map("vat_rate_label")
+  defaultReminderIntervalDays Int      @default(7) @map("default_reminder_interval_days")
+  createdAt                   DateTime @default(now()) @map("created_at")
+  updatedAt                   DateTime @updatedAt @map("updated_at")
+
+  @@map("company_settings")
+}
+
+/// Maps each ClaimStatus enum value to its report display label + colour
+/// (FR-31 "Status Label & Colour Map") — admin-editable data layered on top
+/// of the code-governed ClaimStatus state machine. See README §7.2.
+model ClaimStatusReportLabel {
+  id          String      @id @default(uuid()) @db.Uuid
+  status      ClaimStatus @unique
+  reportLabel String      @map("report_label")
+  colourHex   String      @map("colour_hex")
+  sortOrder   Int         @map("sort_order")
+  createdAt   DateTime    @default(now()) @map("created_at")
+  updatedAt   DateTime    @updatedAt @map("updated_at")
+
+  @@map("claim_status_report_labels")
+}
+
+/// The 29 confirmed commercial products — product-document-requirements.md.
+/// Admin-maintainable (user-roles.md: "add/amend products ... without a
+/// development release").
+model Product {
+  id                String                  @id @default(uuid()) @db.Uuid
+  name              String                  @unique
+  classOfInsurance  ClassOfInsurance        @map("class_of_insurance")
+  isPriorityProduct Boolean                 @default(false) @map("is_priority_product")
+  sortOrder         Int                     @map("sort_order")
+  isActive          Boolean                 @default(true) @map("is_active")
+  createdAt         DateTime                @default(now()) @map("created_at")
+  updatedAt         DateTime                @updatedAt @map("updated_at")
+  checklistItems    ProductChecklistItem[]
+  policySections    PolicySection[]
+
+  @@map("products")
+}
+
+/// Per-product advisory document checklist labels — product-document-requirements.md.
+/// Free-text labels as supplied by the Client, not individually flagged
+/// mandatory/conditional (FR-03: the checklist is advisory in all cases).
+/// Credit Insurance (product #29) has no rows yet — Q-002 open.
+model ProductChecklistItem {
+  id        String   @id @default(uuid()) @db.Uuid
+  productId String   @map("product_id") @db.Uuid
+  label     String
+  sortOrder Int      @map("sort_order")
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@map("product_checklist_items")
+}
+
+/// data-requirements.md §12.3. Contact/products-underwritten fields are BRD
+/// open items — kept minimal here; extend once confirmed.
+model Insurer {
+  id             String          @id @default(uuid()) @db.Uuid
+  name           String          @unique
+  contactDetails String?         @map("contact_details")
+  createdAt      DateTime        @default(now()) @map("created_at")
+  updatedAt      DateTime        @updatedAt @map("updated_at")
+  policySections PolicySection[]
+
+  @@map("insurers")
+}
+
+// ----------------------------------------------------------------------------
+// IDENTITY — extends Supabase `auth.users`. See README §7.5 and
+// ../../03-architecture/system-architecture.md §7 for the Auth Hook /
+// custom-claims mechanism this table feeds.
+// ----------------------------------------------------------------------------
+
+/// One row per portal user, keyed to `auth.users.id` (see README §7.5 for the
+/// trigger pattern that keeps the two in sync). data-requirements.md §12.5/12.9.
+model Profile {
+  /// Same UUID as the corresponding auth.users row — NOT Prisma-generated.
+  id             String    @id @db.Uuid
+  fullName       String    @map("full_name")
+  /// Denormalised copy of auth.users.email for convenient querying/reporting.
+  email          String    @unique
+  phone          String?
+  role           UserRole
+  /// Set only for CLIENT_PRIMARY / CLIENT_SECONDARY roles.
+  clientId       String?   @map("client_id") @db.Uuid
+  isActive       Boolean   @default(true) @map("is_active")
+  /// Convenience cache only — auth.mfa_factors is authoritative (NFR-01).
+  /// Synced by the application when enrolment completes.
+  mfaEnrolledAt  DateTime? @map("mfa_enrolled_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  client                    Client?               @relation(fields: [clientId], references: [id])
+  assignedClients           Client[]              @relation("ClientAssignedBroker")
+  assignedClaims            Claim[]               @relation("ClaimAssignedBroker")
+  lodgedClaims              Claim[]               @relation("ClaimLodgedBy")
+  uploadedDocuments         Document[]
+  createdChecklistItems     ClaimChecklistItem[]
+  sentCommunicationEntries  CommunicationLogEntry[]
+  generatedReports          GeneratedReport[]
+  auditLogEntries           AuditLogEntry[]
+
+  @@index([clientId])
+  @@index([role])
+  @@map("profiles")
+}
+
+// ----------------------------------------------------------------------------
+// CLIENT / POLICY / ASSET DOMAIN
+// ----------------------------------------------------------------------------
+
+/// The SOE client organisation — data-requirements.md §12.4.
+model Client {
+  id                   String       @id @default(uuid()) @db.Uuid
+  name                 String
+  /// Fixed to "SOE" in Phase 1 scope; kept as text rather than an enum in
+  /// case a future phase broadens the client base beyond SOEs.
+  clientType           String       @default("SOE") @map("client_type")
+  assignedBrokerUserId String?      @map("assigned_broker_user_id") @db.Uuid
+  recordStatus         RecordStatus @default(DRAFT) @map("record_status")
+  onboardingDate       DateTime?    @map("onboarding_date") @db.Date
+  createdAt            DateTime     @default(now()) @map("created_at")
+  updatedAt            DateTime     @updatedAt @map("updated_at")
+
+  assignedBroker Profile?  @relation("ClientAssignedBroker", fields: [assignedBrokerUserId], references: [id])
+  contacts       Profile[]
+  policies       Policy[]
+  claims         Claim[]
+  reports        GeneratedReport[]
+
+  @@index([assignedBrokerUserId])
+  @@map("clients")
+}
+
+/// data-requirements.md §12.1. One row per term; `inceptionDate` is the
+/// original cover-start date used for underwriting-year rolling (FR-23) and
+/// persists across renewals — see README §7.4 — while `periodStartDate`/
+/// `periodEndDate` describe the current/latest term (used for "Policy Term"
+/// on report headers, FR-29).
+model Policy {
+  id              String       @id @default(uuid()) @db.Uuid
+  clientId        String       @map("client_id") @db.Uuid
+  policyNumber    String       @map("policy_number")
+  inceptionDate   DateTime     @map("inception_date") @db.Date
+  periodStartDate DateTime     @map("period_start_date") @db.Date
+  periodEndDate   DateTime     @map("period_end_date") @db.Date
+  termsConditions String?      @map("terms_conditions")
+  recordStatus    RecordStatus @default(DRAFT) @map("record_status")
+  createdAt       DateTime     @default(now()) @map("created_at")
+  updatedAt       DateTime     @updatedAt @map("updated_at")
+
+  client            Client                    @relation(fields: [clientId], references: [id])
+  sections          PolicySection[]
+  underwritingYears  PolicyUnderwritingYear[]
+  claims             Claim[]
+  documents          Document[]
+  reports            GeneratedReport[]
+
+  @@index([clientId])
+  @@map("policies")
+}
+
+/// A "Section of Policy" = one product/line of cover within a policy —
+/// data-requirements.md §12.1 ("Section(s) of Policy | Lookup (multi-select)")
+/// and §12.2 ("Linked Policy / Section"). Carries the per-section sum
+/// insured/excess/insurer — see README §7.4 for why insurer sits here rather
+/// than on Policy.
+model PolicySection {
+  id                          String       @id @default(uuid()) @db.Uuid
+  policyId                    String       @map("policy_id") @db.Uuid
+  productId                   String       @map("product_id") @db.Uuid
+  insurerId                   String       @map("insurer_id") @db.Uuid
+  sumInsuredLimitOfIndemnity  Decimal?     @map("sum_insured_limit_of_indemnity") @db.Decimal(14, 2)
+  excessType                  ExcessType?  @map("excess_type")
+  excessValue                 Decimal?     @map("excess_value") @db.Decimal(14, 2)
+  recordStatus                RecordStatus @default(DRAFT) @map("record_status")
+  createdAt                   DateTime     @default(now()) @map("created_at")
+  updatedAt                   DateTime     @updatedAt @map("updated_at")
+
+  policy  Policy    @relation(fields: [policyId], references: [id], onDelete: Cascade)
+  product Product   @relation(fields: [productId], references: [id])
+  insurer Insurer   @relation(fields: [insurerId], references: [id])
+  assets  Asset[]
+  claims  Claim[]
+
+  @@unique([policyId, productId])
+  @@index([policyId])
+  @@map("policy_sections")
+}
+
+/// FR-24 — risk premium & payment frequency, captured per POLICY per
+/// underwriting year (not per section — see README §7.4). Feeds the
+/// Claim-Loss Ratio tab (FR-16); a missing row for a year with claims is
+/// expected and must render as "unavailable", never zero — so this is
+/// intentionally not a hard FK requirement from Claim.
+model PolicyUnderwritingYear {
+  id                        String           @id @default(uuid()) @db.Uuid
+  policyId                  String           @map("policy_id") @db.Uuid
+  underwritingYearStartDate DateTime         @map("underwriting_year_start_date") @db.Date
+  riskPremiumPaid           Decimal          @map("risk_premium_paid") @db.Decimal(14, 2)
+  paymentFrequency          PaymentFrequency @map("payment_frequency")
+  createdAt                 DateTime         @default(now()) @map("created_at")
+  updatedAt                 DateTime         @updatedAt @map("updated_at")
+
+  policy Policy @relation(fields: [policyId], references: [id], onDelete: Cascade)
+
+  @@unique([policyId, underwritingYearStartDate])
+  @@map("policy_underwriting_years")
+}
+
+/// data-requirements.md §12.2 — the per-policy-section asset register.
+/// Only populated where the product requires asset-level claiming.
+model Asset {
+  id                    String       @id @default(uuid()) @db.Uuid
+  policySectionId       String       @map("policy_section_id") @db.Uuid
+  assetType             AssetType    @map("asset_type")
+  description           String
+  assetValueSumInsured  Decimal?     @map("asset_value_sum_insured") @db.Decimal(14, 2)
+  assetLabelBarcode     String?      @map("asset_label_barcode")
+  /// Motor assets only (FR-26).
+  vin                   String?      @map("vin")
+  licencePlate          String?      @map("licence_plate")
+  /// Non-motor assets — Q-016 open re: serial no. vs barcode, both retained for now.
+  serialNumber          String?      @map("serial_number")
+  recordStatus          RecordStatus @default(DRAFT) @map("record_status")
+  createdAt             DateTime     @default(now()) @map("created_at")
+  updatedAt             DateTime     @updatedAt @map("updated_at")
+
+  policySection PolicySection @relation(fields: [policySectionId], references: [id], onDelete: Cascade)
+  claimAssets   ClaimAsset[]
+
+  @@index([policySectionId])
+  @@map("assets")
+}
+
+// ----------------------------------------------------------------------------
+// CLAIMS DOMAIN
+// ----------------------------------------------------------------------------
+
+/// The core entity — data-requirements.md §12.6. See README §5 for the
+/// enforcement split between DB constraints/generated columns and NestJS
+/// service logic for this model's many cross-field business rules.
+model Claim {
+  id                        String              @id @default(uuid()) @db.Uuid
+  /// System-generated, immutable (FR-02, business rule #3) — assigned by
+  /// NestJS at creation, never edited thereafter (enforced in application
+  /// logic; consider a REVOKE UPDATE ... column-level privilege as a
+  /// defence-in-depth option during implementation).
+  inHouseClaimNumber        String              @unique @map("in_house_claim_number")
+  insurerClaimNumber        String?             @map("insurer_claim_number")
+
+  clientId                  String              @map("client_id") @db.Uuid
+  policyId                  String              @map("policy_id") @db.Uuid
+  policySectionId           String              @map("policy_section_id") @db.Uuid
+
+  dateOfLoss                DateTime            @map("date_of_loss") @db.Date
+  dateRegistered            DateTime            @default(now()) @map("date_registered")
+  locationOfLoss            String              @map("location_of_loss")
+
+  /// Derived: dateRegistered - dateOfLoss > 30 days (FR-19). Recommended as a
+  /// Postgres GENERATED ALWAYS AS ... STORED column added via raw SQL in the
+  /// migration (single-row arithmetic — see README §6) rather than an
+  /// application-computed value, so the flag can never silently be wrong.
+  lateReported              Boolean             @map("late_reported")
+  lateReportedMotivation    String?             @map("late_reported_motivation")
+
+  assignedBrokerUserId      String?             @map("assigned_broker_user_id") @db.Uuid
+  lodgedByUserId            String              @map("lodged_by_user_id") @db.Uuid
+  lodgementChannel          LodgementChannel    @map("lodgement_channel")
+
+  assessorNameCompany       String?             @map("assessor_name_company")
+  assessorContactDetails    String?             @map("assessor_contact_details")
+  assessorDateAppointed     DateTime?           @map("assessor_date_appointed") @db.Date
+
+  status                    ClaimStatus         @default(SUBMITTED)
+  decisionOutcome           DecisionOutcome?    @map("decision_outcome")
+  settlementMethod          SettlementMethod?   @map("settlement_method")
+  /// Mandatory when decisionOutcome = REPUDIATED (business rule #8) —
+  /// enforced via a CHECK constraint added in migration, in addition to
+  /// NestJS-level validation (see README §6).
+  repudiationReason         String?             @map("repudiation_reason")
+
+  settlementAmount          Decimal?            @map("settlement_amount") @db.Decimal(14, 2)
+  excessPaid                Decimal?            @map("excess_paid") @db.Decimal(14, 2)
+  recoveries                Decimal?            @db.Decimal(14, 2)
+  salvageValue              Decimal?            @map("salvage_value") @db.Decimal(14, 2)
+  closureDate               DateTime?           @map("closure_date")
+
+  lossDescription           String              @map("loss_description")
+  /// Free text, not linked to a user/asset record — may be the policyholder,
+  /// an employee, or a third party (FR-26).
+  personInvolved            String?             @map("person_involved")
+  caseNumber                String?             @map("case_number")
+
+  /// Derived from dateOfLoss vs policy.inceptionDate (FR-23). Computed by
+  /// NestJS at claim creation (a cross-table lookup — cannot be a Postgres
+  /// GENERATED column, see README §6) and stored as a snapshot so that later
+  /// corrections to a policy's inception date never retroactively rewrite
+  /// history for claims already registered against it.
+  underwritingYearStartDate DateTime            @map("underwriting_year_start_date") @db.Date
+
+  grossClaimAmount          Decimal?            @map("gross_claim_amount") @db.Decimal(14, 2)
+  /// Defaults from policySection.excessValue at capture time; overridable (FR-25).
+  excessApplied             Decimal?            @map("excess_applied") @db.Decimal(14, 2)
+  /// Entered manually by the Broker — never calculated by the system (FR-25).
+  vatAmount                 Decimal?            @map("vat_amount") @db.Decimal(14, 2)
+  /// Generated column: grossClaimAmount - excessApplied + vatAmount (FR-25).
+  netClaimAmount             Decimal?            @map("net_claim_amount") @db.Decimal(14, 2)
+  /// Distinct from netClaimAmount — the figure actually settled by the
+  /// Insurer (Q-017 open re: when the two are expected to differ).
+  amountPaid                 Decimal?            @map("amount_paid") @db.Decimal(14, 2)
+
+  /// Generated column, derived from `status` (FR-30) — see README §7.7 for
+  /// the Outstanding/Resolved mapping assumption.
+  progress                   Progress
+
+  brokerComment               String?             @map("broker_comment")
+  clientComment                String?             @map("client_comment")
+
+  createdAt                   DateTime            @default(now()) @map("created_at")
+  updatedAt                   DateTime            @updatedAt @map("updated_at")
+
+  client         Client                @relation(fields: [clientId], references: [id])
+  policy         Policy                @relation(fields: [policyId], references: [id])
+  policySection  PolicySection         @relation(fields: [policySectionId], references: [id])
+  assignedBroker Profile?              @relation("ClaimAssignedBroker", fields: [assignedBrokerUserId], references: [id])
+  lodgedBy       Profile               @relation("ClaimLodgedBy", fields: [lodgedByUserId], references: [id])
+
+  claimAssets         ClaimAsset[]
+  checklistItems      ClaimChecklistItem[]
+  documents           Document[]
+  communicationLog    CommunicationLogEntry[]
+  notificationLog     NotificationLog[]
+
+  @@index([clientId])
+  @@index([assignedBrokerUserId])
+  @@index([status])
+  @@index([underwritingYearStartDate])
+  @@map("claims")
+}
+
+/// Join table — FR-21: "a single claim may cover more than one asset on the
+/// same policy" (e.g. three vehicles damaged in one incident = one claim).
+model ClaimAsset {
+  claimId String @map("claim_id") @db.Uuid
+  assetId String @map("asset_id") @db.Uuid
+
+  claim Claim @relation(fields: [claimId], references: [id], onDelete: Cascade)
+  asset Asset @relation(fields: [assetId], references: [id])
+
+  @@id([claimId, assetId])
+  @@map("claim_assets")
+}
+
+/// The per-claim instance of the required-document checklist (FR-03).
+/// Snapshotted from ProductChecklistItem at claim creation (a label copy,
+/// not a live FK) so a later edit to product config never rewrites an
+/// existing claim's checklist history — plus Broker-added ad-hoc items
+/// (UC-02 business rule 3).
+model ClaimChecklistItem {
+  id              String              @id @default(uuid()) @db.Uuid
+  claimId         String              @map("claim_id") @db.Uuid
+  label           String
+  source          ChecklistItemSource
+  status          ChecklistItemStatus @default(OUTSTANDING)
+  documentId      String?             @map("document_id") @db.Uuid
+  /// Null when generated automatically from product config at claim creation.
+  createdByUserId String?             @map("created_by_user_id") @db.Uuid
+  createdAt       DateTime            @default(now()) @map("created_at")
+  updatedAt       DateTime            @updatedAt @map("updated_at")
+
+  claim         Claim     @relation(fields: [claimId], references: [id], onDelete: Cascade)
+  document      Document? @relation(fields: [documentId], references: [id])
+  createdByUser Profile?  @relation(fields: [createdByUserId], references: [id])
+
+  @@index([claimId])
+  @@map("claim_checklist_items")
+}
+
+/// FR-03/FR-04 — every uploaded file. Held centrally (per the BRD's own
+/// framing, data-requirements.md §12.7 note) rather than embedded per record
+/// type, while still linking to exactly one owning record: a Claim in almost
+/// every case, or a Policy for the Policy Schedule Document type (the one
+/// exception per the BRD's ERD note). A CHECK constraint enforcing "exactly
+/// one of claimId/policyId is set" should be added in migration.
+model Document {
+  id              String        @id @default(uuid()) @db.Uuid
+  claimId         String?       @map("claim_id") @db.Uuid
+  policyId        String?       @map("policy_id") @db.Uuid
+  documentType    DocumentType  @map("document_type")
+  /// Uploader-supplied label so a document is identifiable without opening
+  /// it (FR-04).
+  customLabel     String?       @map("custom_label")
+  storageBucket   String        @map("storage_bucket")
+  storagePath     String        @map("storage_path")
+  fileName        String        @map("file_name")
+  mimeType        String        @map("mime_type")
+  fileSizeBytes   Int           @map("file_size_bytes")
+  uploadedByUserId String       @map("uploaded_by_user_id") @db.Uuid
+  uploadedAt      DateTime      @default(now()) @map("uploaded_at")
+
+  claim          Claim?               @relation(fields: [claimId], references: [id])
+  policy         Policy?              @relation(fields: [policyId], references: [id])
+  uploadedByUser Profile              @relation(fields: [uploadedByUserId], references: [id])
+  checklistItems ClaimChecklistItem[]
+
+  @@index([claimId])
+  @@index([policyId])
+  @@map("documents")
+}
+
+/// FR-08 — the claim-specific Client↔Broker message thread. Distinct from
+/// Claim.brokerComment/clientComment (FR-27, two separately reportable
+/// fields) — this is a conversational, append-only log. No updatedAt: once
+/// written, an entry is never edited, consistent with it forming part of the
+/// claim's audit trail (UC-12 business rule 1).
+model CommunicationLogEntry {
+  id           String   @id @default(uuid()) @db.Uuid
+  claimId      String   @map("claim_id") @db.Uuid
+  senderUserId String   @map("sender_user_id") @db.Uuid
+  message      String
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  claim            Claim             @relation(fields: [claimId], references: [id], onDelete: Cascade)
+  sender           Profile           @relation(fields: [senderUserId], references: [id])
+  notificationLog  NotificationLog[]
+
+  @@index([claimId])
+  @@map("communication_log_entries")
+}
+
+// ----------------------------------------------------------------------------
+// NOTIFICATIONS
+// ----------------------------------------------------------------------------
+
+/// FR-07/FR-33 outbound email records, including reminder-engine output and
+/// delivery of CommunicationLogEntry messages. NFR-11: failures must be
+/// logged and surfaced to the Administrator, which is exactly what
+/// deliveryStatus/failureReason support.
+model NotificationLog {
+  id                       String                      @id @default(uuid()) @db.Uuid
+  claimId                  String?                     @map("claim_id") @db.Uuid
+  recipientUserId          String?                     @map("recipient_user_id") @db.Uuid
+  /// Snapshot of the address actually used, independent of later profile edits.
+  recipientEmail           String                      @map("recipient_email")
+  notificationType         NotificationType            @map("notification_type")
+  subject                  String
+  deliveryStatus           NotificationDeliveryStatus  @default(PENDING) @map("delivery_status")
+  sentAt                   DateTime?                   @map("sent_at")
+  failureReason            String?                     @map("failure_reason")
+  /// Set when this notification IS the email delivery of a logged message
+  /// (FR-08/FR-20), null for reminders and other system-triggered notices.
+  communicationLogEntryId  String?                      @map("communication_log_entry_id") @db.Uuid
+  createdAt                DateTime                     @default(now()) @map("created_at")
+
+  claim                 Claim?                 @relation(fields: [claimId], references: [id])
+  communicationLogEntry  CommunicationLogEntry? @relation(fields: [communicationLogEntryId], references: [id])
+
+  @@index([claimId])
+  @@index([deliveryStatus])
+  @@map("notification_log")
+}
+
+// ----------------------------------------------------------------------------
+// REPORTING
+// ----------------------------------------------------------------------------
+
+/// FR-28 — every generated report instance, immutable once written.
+/// Regenerating for the same period creates a new row, never replaces one —
+/// so, like CommunicationLogEntry, there is deliberately no updatedAt.
+model GeneratedReport {
+  id                 String          @id @default(uuid()) @db.Uuid
+  clientId           String          @map("client_id") @db.Uuid
+  reportType         ReportType      @map("report_type")
+  scopeType          ReportScopeType @map("scope_type")
+  /// Set only when scopeType = SINGLE_POLICY.
+  policyId           String?         @map("policy_id") @db.Uuid
+  periodStartDate    DateTime        @map("period_start_date") @db.Date
+  periodEndDate      DateTime        @map("period_end_date") @db.Date
+  generatedByUserId  String          @map("generated_by_user_id") @db.Uuid
+  generatedAt        DateTime        @default(now()) @map("generated_at")
+  storageBucket      String          @map("storage_bucket")
+  storagePath        String          @map("storage_path")
+
+  client          Client   @relation(fields: [clientId], references: [id])
+  policy          Policy?  @relation(fields: [policyId], references: [id])
+  generatedByUser Profile  @relation(fields: [generatedByUserId], references: [id])
+
+  @@index([clientId])
+  @@map("generated_reports")
+}
+
+// ----------------------------------------------------------------------------
+// AUDIT
+// ----------------------------------------------------------------------------
+
+/// FR-18/NFR-08 — populated by a global Prisma middleware, not by individual
+/// module code (see ../../03-architecture/system-architecture.md §16).
+/// Immutability is enforced at the database layer: the application's DB role
+/// should be granted INSERT only on this table (no UPDATE/DELETE grant), plus
+/// a matching RLS policy denying both, regardless of role.
+model AuditLogEntry {
+  id          String   @id @default(uuid()) @db.Uuid
+  /// Null = system/scheduled job (e.g. the reminder engine), not a human actor.
+  actorUserId String?  @map("actor_user_id") @db.Uuid
+  action      String
+  entityType  String   @map("entity_type")
+  entityId    String   @map("entity_id") @db.Uuid
+  /// Before/after diff of changed fields.
+  changes     Json?
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  actorUser Profile? @relation(fields: [actorUserId], references: [id])
+
+  @@index([entityType, entityId])
+  @@index([actorUserId])
+  @@map("audit_log_entries")
+}
